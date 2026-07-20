@@ -149,6 +149,11 @@ activemq-data/
 
 # Environments
 .env
+.env.*
+!.env.example
+kaleido.env
+kaleido.env.*
+!kaleido.env.example
 .envrc
 .venv
 env/
@@ -216,3 +221,13 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# Project-local tools, IDE state, generated data, and uploaded files
+/.claude/
+/.design/
+/.idea/
+/CLAUDE.md
+/H5-Vue/.vscode/
+/chroma_db/
+/media/
+/test/chroma_db/

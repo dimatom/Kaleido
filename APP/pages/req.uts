@@ -1,0 +1,97 @@
+// http.js
+
+// 配置基地址和默认请求头
+const BASE_URL = 'http://127.0.0.1:8000'; // 替换为你的基地址
+const DEFAULT_HEADERS = {
+  'Content-Type': 'application/json',
+};
+
+// 请求拦截器（可选）
+const requestInterceptor = (config) => {
+  // 可在此处添加全局逻辑，如显示加载状态
+  uni.showLoading({ title: '加载中...', mask: true });
+  return config;
+};
+
+// 响应拦截器（可选）
+const responseInterceptor = (response) => {
+  uni.hideLoading();
+  return response;
+};
+
+// 错误处理
+const handleError = (error) => {
+  uni.hideLoading();
+  const { statusCode, data } = error;
+
+  // 处理不同状态码
+  switch (statusCode) {
+    case 401:
+      uni.navigateTo({ url: '/pages/login/login' });
+      break;
+    case 403:
+      uni.showToast({ title: '无访问权限', icon: 'none' });
+      break;
+    case 500:
+      uni.showToast({ title: '服务器错误', icon: 'none' });
+      break;
+    default:
+      uni.showToast({ title: data?.message || '请求失败', icon: 'none' });
+  }
+
+  return Promise.reject(error);
+};
+
+// 核心请求方法
+const request = (url, options = {}) => {
+  // 合并配置
+  const config = requestInterceptor({
+    ...options,
+    header: {
+      ...DEFAULT_HEADERS,
+      // 自动注入 Token
+      ...(uni.getStorageSync('access_token') ? { 
+        Authorization: `Bearer ${uni.getStorageSync('access_token')}` 
+      } : {}),
+      ...(options.header || {}),
+    },
+  });
+
+  return new Promise((resolve, reject) => {
+    uni.request({
+      url: url.startsWith('http') ? url : `${BASE_URL}${url}`,
+      method: config.method || 'GET',
+      header: config.header,
+      data: config.data,
+      timeout: config.timeout || 15000,
+      success: (res) => {
+        const processedRes = responseInterceptor(res);
+        if (res.statusCode >= 200 && res.statusCode < 300) {
+          // 根据业务逻辑调整此处判断（例如检查 res.data.code）
+          resolve(processedRes.data);
+        } else {
+          handleError({ ...res, data: processedRes.data }).catch(reject);
+        }
+      },
+      fail: (err) => {
+        handleError({
+          statusCode: 0,
+          data: { message: '网络连接失败，请检查网络' }
+        }).catch(reject);
+      }
+    });
+  });
+};
+
+// 导出常用方法
+export const http = {
+  get: (url, params) => request(url, { method: 'GET', data: params }),
+  post: (url, data) => request(url, { method: 'POST', data }),
+  put: (url, data) => request(url, { method: 'PUT', data }),
+  delete: (url, data) => request(url, { method: 'DELETE', data }),
+};
+
+// 使用示例：
+// import { http } from '@/utils/http';
+// http.get('/user/info').then(...).catch(...);
+// http.post('/login', { username, password }).then(...);
