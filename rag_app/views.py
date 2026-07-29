@@ -1,14 +1,30 @@
+from django.contrib.auth import get_user_model
 from rest_framework.views import APIView
 from rest_framework.response import Response
 from rest_framework import status
 from rest_framework.pagination import PageNumberPagination
-from .models import KnowledgeRepository, Document, ChatSession, ChatMessageHistory
+from .models import (
+    ChatMessageHistory,
+    ChatSession,
+    Document,
+    Evaluation,
+    EvaluationData,
+    EvaluationRun,
+    EvaluationTask,
+    KnowledgeRepository,
+)
+from .evaluation_service import (
+    build_evaluation_turns,
+    indexing_config_changed,
+    normalize_rag_config,
+    parse_datetime,
+    validate_rag_config,
+)
 from . import task_store
 from rest_framework import serializers
 from django.http import FileResponse, Http404, StreamingHttpResponse
 from .rag_core import RAGCore
 from Kaleido.logger import logger
-import os
 import uuid
 
 
@@ -359,7 +375,371 @@ class TaskListView(APIView):
         )
 
 
-# ==================== Chat 接口 ====================
+# ==================== RAG 评估接口 ====================
+
+class EvaluationAdminMixin:
+    """评估功能仅对超级管理员开放。"""
+
+    def ensure_superuser(self, request):
+        if not request.user.is_superuser:
+            return Response({'error': '仅超级管理员可使用评估功能'}, status=status.HTTP_403_FORBIDDEN)
+        return None
+
+
+def _evaluation_turns(repository, start_at, end_at, selected_user_ids):
+    sessions = ChatSession.objects.filter(dim_knowledge_repository_id=repository)
+    if selected_user_ids:
+        sessions = sessions.filter(creator_id__in=selected_user_ids)
+    session_ids = list(sessions.values_list('id', flat=True))
+    if not session_ids:
+        return []
+    messages = ChatMessageHistory.objects.filter(session_id__in=session_ids)
+    if start_at:
+        messages = messages.filter(created_at__gte=start_at)
+    if end_at:
+        messages = messages.filter(created_at__lte=end_at)
+    turns = []
+    for session_id in session_ids:
+        turns.extend(build_evaluation_turns(messages.filter(session_id=session_id).order_by('created_at', 'id')))
+    return turns
+
+
+class EvaluationSerializer(serializers.ModelSerializer):
+    data_count = serializers.SerializerMethodField()
+
+    def get_data_count(self, obj):
+        return obj.data_items.count()
+
+    class Meta:
+        model = Evaluation
+        fields = [
+            'id', 'dim_knowledge_repository_id', 'name', 'description', 'status', 'progress',
+            'conversation_start_at', 'conversation_end_at', 'selected_user_ids', 'creator',
+            'createdon', 'modifiedon', 'data_count',
+        ]
+        read_only_fields = ['id', 'status', 'progress', 'creator', 'createdon', 'modifiedon']
+
+
+class EvaluationDataSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = EvaluationData
+        fields = ['id', 'dim_evaluation_id', 'question', 'ai_answer', 'reference_answer', 'history_context', 'createdon', 'modifiedon']
+        read_only_fields = ['id', 'dim_evaluation_id', 'createdon', 'modifiedon']
+
+
+class EvaluationTaskSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = EvaluationTask
+        fields = ['id', 'dim_evaluation_id', 'name', 'rag_config', 'status', 'task_mark', 'creator', 'createdon', 'modifiedon']
+        read_only_fields = ['id', 'dim_evaluation_id', 'status', 'creator', 'createdon', 'modifiedon']
+
+
+class EvaluationRunSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = EvaluationRun
+        fields = ['id', 'dim_evaluation_task_id', 'status', 'celery_task_id', 'result', 'file', 'error_message', 'started_at', 'finished_at', 'createdon']
+
+
+class EvaluationPagination(PageNumberPagination):
+    page_size = 10
+    page_size_query_param = 'page_size'
+    max_page_size = 100
+
+
+class EvaluationPrecheckView(EvaluationAdminMixin, APIView):
+    def get(self, request):
+        denied = self.ensure_superuser(request)
+        if denied:
+            return denied
+        user_model = get_user_model()
+        users = user_model.objects.filter(is_active=True).order_by('username').values('id', 'username')
+        return Response({'users': list(users)})
+
+    def post(self, request):
+        denied = self.ensure_superuser(request)
+        if denied:
+            return denied
+        repository_id = request.data.get('knowledge_repository_id')
+        try:
+            repository = KnowledgeRepository.objects.get(pk=repository_id)
+            start_at = parse_datetime(request.data.get('conversation_start_at'))
+            end_at = parse_datetime(request.data.get('conversation_end_at'))
+        except (KnowledgeRepository.DoesNotExist, ValueError):
+            return Response({'error': '知识库或时间参数无效'}, status=status.HTTP_400_BAD_REQUEST)
+        user_ids = request.data.get('selected_user_ids') or []
+        return Response({'available_count': len(_evaluation_turns(repository, start_at, end_at, user_ids))})
+
+
+class EvaluationListCreateView(EvaluationAdminMixin, APIView):
+    def get(self, request):
+        denied = self.ensure_superuser(request)
+        if denied:
+            return denied
+        queryset = Evaluation.objects.all().order_by('-createdon')
+        repository_id = request.query_params.get('knowledge_repository_id')
+        if repository_id:
+            queryset = queryset.filter(dim_knowledge_repository_id_id=repository_id)
+        return Response(EvaluationSerializer(queryset, many=True).data)
+
+    def post(self, request):
+        denied = self.ensure_superuser(request)
+        if denied:
+            return denied
+        try:
+            repository = KnowledgeRepository.objects.get(pk=request.data.get('knowledge_repository_id'))
+            start_at = parse_datetime(request.data.get('conversation_start_at'))
+            end_at = parse_datetime(request.data.get('conversation_end_at'))
+        except (KnowledgeRepository.DoesNotExist, ValueError):
+            return Response({'error': '知识库或时间参数无效'}, status=status.HTTP_400_BAD_REQUEST)
+        user_ids = request.data.get('selected_user_ids') or []
+        evaluation = Evaluation.objects.create(
+            dim_knowledge_repository_id=repository,
+            name=request.data.get('name') or f'{repository.name} 评估',
+            description=request.data.get('description', ''),
+            status='generating',
+            conversation_start_at=start_at,
+            conversation_end_at=end_at,
+            selected_user_ids=user_ids,
+            creator=request.user,
+        )
+        turns = _evaluation_turns(repository, start_at, end_at, user_ids)
+        EvaluationData.objects.bulk_create([
+            EvaluationData(dim_evaluation_id=evaluation, **turn) for turn in turns
+        ])
+        config = normalize_rag_config(repository.rag_config)
+        EvaluationTask.objects.create(
+            dim_evaluation_id=evaluation,
+            name='基线配置',
+            rag_config=config,
+            status='ready',
+            task_mark='baseline',
+            creator=request.user,
+        )
+        evaluation.status = 'ready'
+        evaluation.progress = 100
+        evaluation.save(update_fields=['status', 'progress', 'modifiedon'])
+        return Response(EvaluationSerializer(evaluation).data, status=status.HTTP_201_CREATED)
+
+
+class EvaluationDetailView(EvaluationAdminMixin, APIView):
+    def get(self, request, pk):
+        denied = self.ensure_superuser(request)
+        if denied:
+            return denied
+        try:
+            return Response(EvaluationSerializer(Evaluation.objects.get(pk=pk)).data)
+        except Evaluation.DoesNotExist:
+            return Response({'error': '评估事项不存在'}, status=status.HTTP_404_NOT_FOUND)
+
+
+class EvaluationDataListCreateView(EvaluationAdminMixin, APIView):
+    def get(self, request, evaluation_id):
+        denied = self.ensure_superuser(request)
+        if denied:
+            return denied
+        queryset = EvaluationData.objects.filter(dim_evaluation_id_id=evaluation_id).order_by('-createdon')
+        paginator = EvaluationPagination()
+        page = paginator.paginate_queryset(queryset, request)
+        return paginator.get_paginated_response(EvaluationDataSerializer(page, many=True).data)
+
+    def post(self, request, evaluation_id):
+        denied = self.ensure_superuser(request)
+        if denied:
+            return denied
+        try:
+            evaluation = Evaluation.objects.get(pk=evaluation_id)
+        except Evaluation.DoesNotExist:
+            return Response({'error': '评估事项不存在'}, status=status.HTTP_404_NOT_FOUND)
+        serializer = EvaluationDataSerializer(data=request.data)
+        if serializer.is_valid():
+            serializer.save(dim_evaluation_id=evaluation)
+            return Response(serializer.data, status=status.HTTP_201_CREATED)
+        return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
+
+
+class EvaluationDataDetailView(EvaluationAdminMixin, APIView):
+    def post(self, request, pk):
+        denied = self.ensure_superuser(request)
+        if denied:
+            return denied
+        try:
+            item = EvaluationData.objects.get(pk=pk)
+        except EvaluationData.DoesNotExist:
+            return Response({'error': '评估数据不存在'}, status=status.HTTP_404_NOT_FOUND)
+        serializer = EvaluationDataSerializer(item, data=request.data, partial=True)
+        if serializer.is_valid():
+            serializer.save()
+            return Response(serializer.data)
+        return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
+
+    def delete(self, request, pk):
+        denied = self.ensure_superuser(request)
+        if denied:
+            return denied
+        deleted, _ = EvaluationData.objects.filter(pk=pk).delete()
+        if not deleted:
+            return Response({'error': '评估数据不存在'}, status=status.HTTP_404_NOT_FOUND)
+        return Response({'message': '删除成功'})
+
+
+class EvaluationTaskListCreateView(EvaluationAdminMixin, APIView):
+    def get(self, request, evaluation_id):
+        denied = self.ensure_superuser(request)
+        if denied:
+            return denied
+        return Response(EvaluationTaskSerializer(EvaluationTask.objects.filter(dim_evaluation_id_id=evaluation_id).order_by('createdon'), many=True).data)
+
+    def post(self, request, evaluation_id):
+        denied = self.ensure_superuser(request)
+        if denied:
+            return denied
+        try:
+            evaluation = Evaluation.objects.get(pk=evaluation_id)
+            config = validate_rag_config(request.data.get('rag_config'))
+        except Evaluation.DoesNotExist:
+            return Response({'error': '评估事项不存在'}, status=status.HTTP_404_NOT_FOUND)
+        except ValueError as exc:
+            return Response({'error': str(exc)}, status=status.HTTP_400_BAD_REQUEST)
+        task = EvaluationTask.objects.create(
+            dim_evaluation_id=evaluation,
+            name=request.data.get('name') or '候选配置',
+            rag_config=config,
+            status='ready',
+            task_mark=request.data.get('task_mark', 'candidate'),
+            creator=request.user,
+        )
+        return Response(EvaluationTaskSerializer(task).data, status=status.HTTP_201_CREATED)
+
+
+class EvaluationTaskDetailView(EvaluationAdminMixin, APIView):
+    def post(self, request, pk):
+        denied = self.ensure_superuser(request)
+        if denied:
+            return denied
+        try:
+            task = EvaluationTask.objects.get(pk=pk)
+            payload = request.data.copy()
+            if 'rag_config' in payload:
+                payload['rag_config'] = validate_rag_config(payload['rag_config'])
+        except EvaluationTask.DoesNotExist:
+            return Response({'error': '评估任务不存在'}, status=status.HTTP_404_NOT_FOUND)
+        except ValueError as exc:
+            return Response({'error': str(exc)}, status=status.HTTP_400_BAD_REQUEST)
+        if task.status == 'running':
+            return Response({'error': '任务执行中，暂不可修改'}, status=status.HTTP_400_BAD_REQUEST)
+        serializer = EvaluationTaskSerializer(task, data=payload, partial=True)
+        if serializer.is_valid():
+            serializer.save(status='ready')
+            return Response(serializer.data)
+        return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
+
+    def delete(self, request, pk):
+        denied = self.ensure_superuser(request)
+        if denied:
+            return denied
+        task = EvaluationTask.objects.filter(pk=pk).first()
+        if not task:
+            return Response({'error': '评估任务不存在'}, status=status.HTTP_404_NOT_FOUND)
+        if task.status == 'running':
+            return Response({'error': '任务执行中，暂不可删除'}, status=status.HTTP_400_BAD_REQUEST)
+        task.delete()
+        return Response({'message': '删除成功'})
+
+
+class EvaluationRunListStartView(EvaluationAdminMixin, APIView):
+    def get(self, request, task_id):
+        denied = self.ensure_superuser(request)
+        if denied:
+            return denied
+        return Response(EvaluationRunSerializer(EvaluationRun.objects.filter(dim_evaluation_task_id_id=task_id).order_by('-createdon'), many=True).data)
+
+    def post(self, request, task_id):
+        denied = self.ensure_superuser(request)
+        if denied:
+            return denied
+        try:
+            task = EvaluationTask.objects.select_related('dim_evaluation_id__dim_knowledge_repository_id').get(pk=task_id)
+        except EvaluationTask.DoesNotExist:
+            return Response({'error': '评估任务不存在'}, status=status.HTTP_404_NOT_FOUND)
+        if task.status == 'running':
+            return Response({'error': '当前任务正在执行'}, status=status.HTTP_400_BAD_REQUEST)
+        data_count = task.dim_evaluation_id.data_items.count()
+        missing_count = task.dim_evaluation_id.data_items.filter(reference_answer__isnull=True).count()
+        missing_count += sum(
+            1 for item in task.dim_evaluation_id.data_items.exclude(reference_answer__isnull=True).values_list('reference_answer', flat=True)
+            if not str(item or '').strip()
+        )
+        if not data_count or missing_count:
+            return Response({'error': '评估数据不完整', 'missing_reference_answer_count': missing_count}, status=status.HTTP_400_BAD_REQUEST)
+        repository = task.dim_evaluation_id.dim_knowledge_repository_id
+        if task_store.km_has_running_task(str(repository.id)):
+            return Response({'error': '知识库有正在进行的索引任务，请稍后再试'}, status=status.HTTP_400_BAD_REQUEST)
+        task_id_value = str(uuid.uuid4())
+        run = EvaluationRun.objects.create(dim_evaluation_task_id=task, celery_task_id=task_id_value)
+        task_store.create_task(
+            task_id=task_id_value, user_id=str(request.user.id), km_id=str(repository.id), km_name=repository.name,
+            doc_ids=[], task_type='rag_evaluation', title=f'RAG评估：{task.name}',
+            item_count=data_count, item_unit='条数据',
+        )
+        try:
+            from .tasks import run_evaluation_task
+            run_evaluation_task.apply_async(args=[str(run.id)], task_id=task_id_value)
+        except Exception as exc:
+            task_store.finish_task(task_id_value, 'FAILURE', '任务提交失败', error=str(exc)[:500])
+            run.status = 'FAILURE'
+            run.error_message = '任务提交失败'
+            run.save(update_fields=['status', 'error_message'])
+            return Response({'error': '任务提交失败，请稍后再试'}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+        return Response(EvaluationRunSerializer(run).data, status=status.HTTP_201_CREATED)
+
+
+class EvaluationRunDownloadView(EvaluationAdminMixin, APIView):
+    def get(self, request, pk):
+        denied = self.ensure_superuser(request)
+        if denied:
+            return denied
+        try:
+            run = EvaluationRun.objects.get(pk=pk)
+            if not run.file:
+                raise EvaluationRun.DoesNotExist
+            response = FileResponse(run.file.open('rb'), as_attachment=True, filename=f'evaluation_{run.id}.xlsx')
+            return response
+        except (EvaluationRun.DoesNotExist, FileNotFoundError):
+            raise Http404('评估报告不存在')
+
+
+class EvaluationApplyConfigView(EvaluationAdminMixin, APIView):
+    def post(self, request, task_id):
+        denied = self.ensure_superuser(request)
+        if denied:
+            return denied
+        try:
+            task = EvaluationTask.objects.select_related('dim_evaluation_id__dim_knowledge_repository_id').get(pk=task_id)
+        except EvaluationTask.DoesNotExist:
+            return Response({'error': '评估任务不存在'}, status=status.HTTP_404_NOT_FOUND)
+        repository = task.dim_evaluation_id.dim_knowledge_repository_id
+        new_config = validate_rag_config(task.rag_config)
+        requires_rebuild = indexing_config_changed(repository.rag_config, new_config)
+        if requires_rebuild and task_store.km_has_running_task(str(repository.id)):
+            return Response({'error': '知识库已有进行中的索引任务'}, status=status.HTTP_400_BAD_REQUEST)
+        repository.rag_config = new_config
+        repository.save(update_fields=['rag_config', 'modifiedon'])
+        EvaluationTask.objects.filter(dim_evaluation_id=task.dim_evaluation_id).exclude(pk=task.pk).filter(task_mark='selected').update(task_mark='candidate')
+        task.task_mark = 'selected'
+        task.save(update_fields=['task_mark', 'modifiedon'])
+        response = {'message': '配置已应用', 'rebuild_task_id': None}
+        if requires_rebuild:
+            rebuild_task_id = str(uuid.uuid4())
+            documents = list(Document.objects.filter(dim_knowledge_repository_id=repository).values_list('id', flat=True))
+            task_store.create_task(
+                task_id=rebuild_task_id, user_id=str(request.user.id), km_id=str(repository.id), km_name=repository.name,
+                doc_ids=[str(document_id) for document_id in documents], task_type='index_rebuild',
+                title=f'重建索引：{repository.name}', item_count=len(documents), item_unit='个文件',
+            )
+            from .tasks import rebuild_knowledge_repository_index_task
+            rebuild_knowledge_repository_index_task.apply_async(args=[str(repository.id), str(request.user.id)], task_id=rebuild_task_id)
+            response['rebuild_task_id'] = rebuild_task_id
+        return Response(response)
 
 class ChatSessionSerializer(serializers.ModelSerializer):
     class Meta:
@@ -509,7 +889,11 @@ class ChatStreamView(APIView):
         sys_prompt = knowledge_repository.system_prompt
 
         def event_stream():
-            rag = RAGCore(str(knowledge_repository_id), streaming=True)
+            rag = RAGCore(
+                str(knowledge_repository_id),
+                streaming=True,
+                rag_config=knowledge_repository.rag_config,
+            )
             chain = rag.build_ensemble_chain()
             try:
                 for token in chain.stream(
@@ -598,7 +982,11 @@ class ChatView(APIView):
         sys_prompt = knowledge_repository.system_prompt
 
         def event_stream():
-            rag = RAGCore(str(knowledge_repository_id), streaming=True)
+            rag = RAGCore(
+                str(knowledge_repository_id),
+                streaming=True,
+                rag_config=knowledge_repository.rag_config,
+            )
             chain = rag.build_chain()
             try:
                 for token in chain.stream(

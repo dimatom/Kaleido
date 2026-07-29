@@ -43,7 +43,7 @@ def _now() -> float:
 def _serialize_meta(raw: dict) -> dict:
     """将 Redis HASH 中的字符串值反序列化为合适类型"""
     meta = dict(raw)
-    int_fields = ('doc_count', 'current', 'total', 'progress')
+    int_fields = ('doc_count', 'item_count', 'current', 'total', 'progress')
     float_fields = ('created_at', 'updated_at')
     for f in int_fields:
         if f in meta and meta[f] not in (None, ''):
@@ -67,10 +67,21 @@ def _serialize_meta(raw: dict) -> dict:
     return meta
 
 
-def create_task(task_id: str, user_id: str, km_id: str, km_name: str, doc_ids: list) -> dict:
-    """创建任务元数据并建立索引（提交任务前调用）"""
+def create_task(
+    task_id: str,
+    user_id: str,
+    km_id: str,
+    km_name: str,
+    doc_ids: list,
+    task_type: str = '',
+    title: str = '',
+    item_count: int | None = None,
+    item_unit: str = '',
+) -> dict:
+    """创建任务元数据并建立索引（提交任务前调用）。"""
     r = get_redis()
     now = _now()
+    count = len(doc_ids) if item_count is None else item_count
     meta = {
         'task_id': task_id,
         'user_id': str(user_id),
@@ -78,9 +89,13 @@ def create_task(task_id: str, user_id: str, km_id: str, km_name: str, doc_ids: l
         'km_name': km_name or '',
         'doc_ids': json.dumps([str(d) for d in doc_ids]),
         'doc_count': len(doc_ids),
+        'task_type': task_type or '',
+        'title': title or '',
+        'item_count': count,
+        'item_unit': item_unit or '',
         'status': 'PENDING',
         'current': 0,
-        'total': len(doc_ids),
+        'total': count,
         'progress': 0,
         'context': '排队等待中',
         'error': '',

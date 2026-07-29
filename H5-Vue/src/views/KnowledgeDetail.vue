@@ -35,6 +35,7 @@
               <el-button type="primary" @click="handleEdit">编辑</el-button>
               <el-button type="danger" :loading="deleteLoading" @click="handleDelete">删除</el-button>
               <el-button type="success" @click="handleChat">AI 对话</el-button>
+              <el-button v-if="isSuperuser" type="warning" @click="openEvaluationDialog">创建评估</el-button>
             </div>
           </div>
         </el-card>
@@ -147,6 +148,34 @@
         <el-button type="primary" :loading="uploading" @click="submitUpload">上传</el-button>
       </template>
     </el-dialog>
+    <!-- 创建评估对话框 -->
+    <el-dialog v-model="evaluationVisible" title="创建 RAG 评估" width="520px">
+      <el-form label-width="100px">
+        <el-form-item label="评估名称">
+          <el-input v-model="evaluationForm.name" placeholder="默认使用知识库名称" />
+        </el-form-item>
+        <el-form-item label="消息时间">
+          <el-date-picker
+            v-model="evaluationForm.timeRange"
+            type="datetimerange"
+            start-placeholder="开始时间"
+            end-placeholder="结束时间"
+            value-format="YYYY-MM-DDTHH:mm:ss"
+          />
+        </el-form-item>
+        <el-form-item label="评估用户">
+          <el-select v-model="evaluationForm.selectedUserIds" multiple filterable clearable placeholder="不选表示全部用户" style="width: 100%">
+            <el-option v-for="user in evaluationUsers" :key="user.id" :label="user.username" :value="user.id" />
+          </el-select>
+        </el-form-item>
+      </el-form>
+      <el-alert v-if="precheckCount !== null" :title="`可生成 ${precheckCount} 条完整问答数据`" type="info" :closable="false" />
+      <template #footer>
+        <el-button @click="evaluationVisible = false">取消</el-button>
+        <el-button :loading="prechecking" @click="precheckEvaluation">预检</el-button>
+        <el-button type="primary" :loading="creatingEvaluation" @click="createEvaluation">创建评估</el-button>
+      </template>
+    </el-dialog>
   </div>
 </template>
 
@@ -183,6 +212,13 @@ const uploading = ref(false)
 const uploadRef = ref(null)
 const uploadFileList = ref([])
 const tableRef = ref(null)
+const isSuperuser = ref(false)
+const evaluationVisible = ref(false)
+const prechecking = ref(false)
+const creatingEvaluation = ref(false)
+const precheckCount = ref(null)
+const evaluationUsers = ref([])
+const evaluationForm = ref({ name: '', timeRange: [], selectedUserIds: [] })
 
 const imageUrl = computed(() => {
   if (knowledge.value?.image) {
@@ -203,9 +239,15 @@ const canParse = computed(() => {
   return selectedRows.value.every(row => row.parse_status === 'unparsed' || row.parse_status === 'failed')
 })
 
-onMounted(() => {
+onMounted(async () => {
   loadKnowledge()
   loadDocuments()
+  try {
+    const response = await req.get('/getuser/')
+    isSuperuser.value = !!response.data.is_superuser
+  } catch (error) {
+    isSuperuser.value = false
+  }
 })
 
 async function loadKnowledge() {
@@ -270,6 +312,56 @@ function handleChat() {
       knowledge_repository_id: knowledgeId.value
     }
   })
+}
+
+async function openEvaluationDialog() {
+  evaluationForm.value = { name: `${knowledge.value?.name || ''} 评估`, timeRange: [], selectedUserIds: [] }
+  precheckCount.value = null
+  try {
+    const response = await req.get('/evaluation/precheck/')
+    evaluationUsers.value = response.data.users || []
+  } catch (error) {
+    ElMessage.error(error?.response?.data?.error || '加载用户列表失败')
+    return
+  }
+  evaluationVisible.value = true
+}
+
+function evaluationPayload() {
+  const [conversation_start_at, conversation_end_at] = evaluationForm.value.timeRange || []
+  return {
+    knowledge_repository_id: knowledgeId.value,
+    name: evaluationForm.value.name,
+    conversation_start_at,
+    conversation_end_at,
+    selected_user_ids: evaluationForm.value.selectedUserIds
+  }
+}
+
+async function precheckEvaluation() {
+  prechecking.value = true
+  try {
+    const response = await req.post('/evaluation/precheck/', evaluationPayload())
+    precheckCount.value = response.data.available_count || 0
+  } catch (error) {
+    ElMessage.error(error?.response?.data?.error || '预检失败')
+  } finally {
+    prechecking.value = false
+  }
+}
+
+async function createEvaluation() {
+  creatingEvaluation.value = true
+  try {
+    const response = await req.post('/evaluation/', evaluationPayload())
+    evaluationVisible.value = false
+    ElMessage.success('评估已创建')
+    router.push(`/evaluation/${response.data.id}`)
+  } catch (error) {
+    ElMessage.error(error?.response?.data?.error || '创建评估失败')
+  } finally {
+    creatingEvaluation.value = false
+  }
 }
 
 function handleFormSuccess() {

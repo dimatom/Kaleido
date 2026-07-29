@@ -15,6 +15,7 @@ class KnowledgeRepository(models.Model):
     name = models.CharField(max_length=255, verbose_name="名称")
     desc = models.TextField(blank=True, verbose_name="描述")
     system_prompt = models.TextField(blank=True, verbose_name="系统提示词")
+    rag_config = models.JSONField(default=dict, verbose_name="RAG配置")
     image = models.ImageField(upload_to="knowledge_repository/images/", blank=True, null=True, verbose_name="图片")
     creator = models.ForeignKey(
         settings.AUTH_USER_MODEL,
@@ -35,6 +36,156 @@ class KnowledgeRepository(models.Model):
 
     def __str__(self):
         return self.name
+
+
+class Evaluation(models.Model):
+    """知识库 RAG 评估事项。"""
+
+    STATUS_CHOICES = [
+        ('draft', '草稿'),
+        ('generating', '生成中'),
+        ('ready', '已就绪'),
+        ('failed', '生成失败'),
+    ]
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False, verbose_name="ID")
+    dim_knowledge_repository_id = models.ForeignKey(
+        KnowledgeRepository,
+        on_delete=models.CASCADE,
+        related_name="evaluations",
+        verbose_name="知识库",
+        db_column="dim_knowledge_repository_id",
+    )
+    name = models.CharField(max_length=255, verbose_name="名称")
+    description = models.TextField(blank=True, verbose_name="描述")
+    status = models.CharField(max_length=20, choices=STATUS_CHOICES, default='draft', verbose_name="状态")
+    progress = models.PositiveSmallIntegerField(default=0, verbose_name="数据生成进度")
+    conversation_start_at = models.DateTimeField(null=True, blank=True, verbose_name="消息开始时间")
+    conversation_end_at = models.DateTimeField(null=True, blank=True, verbose_name="消息结束时间")
+    selected_user_ids = models.JSONField(default=list, verbose_name="筛选用户")
+    creator = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="created_evaluations",
+        verbose_name="创建人",
+        db_column="creator",
+    )
+    createdon = models.DateTimeField(auto_now_add=True, verbose_name="创建时间")
+    modifiedon = models.DateTimeField(auto_now=True, verbose_name="修改时间")
+
+    class Meta:
+        db_table = "dim_evaluation"
+        verbose_name = "评估事项"
+        verbose_name_plural = "评估事项"
+        indexes = [models.Index(fields=['dim_knowledge_repository_id', '-createdon'])]
+
+    def __str__(self):
+        return self.name
+
+
+class EvaluationData(models.Model):
+    """一条可人工维护的 RAG 评估数据。"""
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False, verbose_name="ID")
+    dim_evaluation_id = models.ForeignKey(
+        Evaluation,
+        on_delete=models.CASCADE,
+        related_name="data_items",
+        verbose_name="评估事项",
+        db_column="dim_evaluation_id",
+    )
+    question = models.TextField(verbose_name="问题")
+    ai_answer = models.TextField(blank=True, verbose_name="原AI回答")
+    reference_answer = models.TextField(blank=True, verbose_name="标准答案")
+    history_context = models.JSONField(default=list, verbose_name="历史上下文")
+    createdon = models.DateTimeField(auto_now_add=True, verbose_name="创建时间")
+    modifiedon = models.DateTimeField(auto_now=True, verbose_name="修改时间")
+
+    class Meta:
+        db_table = "dim_evaluation_data"
+        verbose_name = "评估数据"
+        verbose_name_plural = "评估数据"
+
+
+class EvaluationTask(models.Model):
+    """一组待对比的 RAG 配置。"""
+
+    STATUS_CHOICES = [
+        ('draft', '草稿'),
+        ('ready', '已就绪'),
+        ('running', '执行中'),
+        ('success', '执行成功'),
+        ('failed', '执行失败'),
+    ]
+    TASK_MARK_CHOICES = [
+        ('baseline', '基线'),
+        ('candidate', '候选'),
+        ('selected', '已选择'),
+    ]
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False, verbose_name="ID")
+    dim_evaluation_id = models.ForeignKey(
+        Evaluation,
+        on_delete=models.CASCADE,
+        related_name="tasks",
+        verbose_name="评估事项",
+        db_column="dim_evaluation_id",
+    )
+    name = models.CharField(max_length=255, verbose_name="名称")
+    rag_config = models.JSONField(default=dict, verbose_name="RAG配置")
+    status = models.CharField(max_length=20, choices=STATUS_CHOICES, default='draft', verbose_name="状态")
+    task_mark = models.CharField(max_length=20, choices=TASK_MARK_CHOICES, default='candidate', verbose_name="任务标记")
+    creator = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="created_evaluation_tasks",
+        verbose_name="创建人",
+        db_column="creator",
+    )
+    createdon = models.DateTimeField(auto_now_add=True, verbose_name="创建时间")
+    modifiedon = models.DateTimeField(auto_now=True, verbose_name="修改时间")
+
+    class Meta:
+        db_table = "dim_evaluation_task"
+        verbose_name = "评估任务"
+        verbose_name_plural = "评估任务"
+
+
+class EvaluationRun(models.Model):
+    """评估任务的一次异步执行记录。"""
+
+    STATUS_CHOICES = [
+        ('PENDING', '等待中'),
+        ('PROGRESS', '执行中'),
+        ('SUCCESS', '成功'),
+        ('FAILURE', '失败'),
+    ]
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False, verbose_name="ID")
+    dim_evaluation_task_id = models.ForeignKey(
+        EvaluationTask,
+        on_delete=models.CASCADE,
+        related_name="runs",
+        verbose_name="评估任务",
+        db_column="dim_evaluation_task_id",
+    )
+    status = models.CharField(max_length=20, choices=STATUS_CHOICES, default='PENDING', verbose_name="状态")
+    celery_task_id = models.CharField(max_length=255, blank=True, verbose_name="Celery任务ID")
+    result = models.JSONField(default=dict, verbose_name="汇总结果")
+    file = models.FileField(upload_to='evaluation/reports/', null=True, blank=True, verbose_name="报告文件")
+    error_message = models.TextField(blank=True, verbose_name="错误信息")
+    started_at = models.DateTimeField(null=True, blank=True, verbose_name="开始时间")
+    finished_at = models.DateTimeField(null=True, blank=True, verbose_name="结束时间")
+    createdon = models.DateTimeField(auto_now_add=True, verbose_name="创建时间")
+
+    class Meta:
+        db_table = "dim_evaluation_run"
+        verbose_name = "评估执行"
+        verbose_name_plural = "评估执行"
 
 
 class Document(models.Model):

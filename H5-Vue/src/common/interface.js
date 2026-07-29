@@ -127,8 +127,28 @@ function post(url, data) {
     return http.post(url, data);
 }
 
+function del(url) {
+    return http.delete(url);
+}
+
 function opendownload(url) {
     window.open(BaseUrl + url, '_blank');
+}
+
+async function downloadWithAuth(url, filename) {
+    const response = await fetch(BaseUrl + url, {
+        headers: { Authorization: 'Bearer ' + getAccessToken() }
+    });
+    if (!response.ok) throw new Error(`HTTP ${response.status}`);
+    const blob = await response.blob();
+    const objectUrl = URL.createObjectURL(blob);
+    const link = document.createElement('a');
+    link.href = objectUrl;
+    link.download = filename || 'download';
+    document.body.appendChild(link);
+    link.click();
+    link.remove();
+    URL.revokeObjectURL(objectUrl);
 }
 
 function getBaseUrl() {
@@ -173,8 +193,10 @@ export default {
     getBaseUrl,
     get,
     post,
+    del,
     postStream,
     opendownload,
+    downloadWithAuth,
     login,
     logout,
     getAccessToken,

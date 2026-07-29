@@ -178,11 +178,15 @@ class OllamaRerankCompressor(BaseDocumentCompressor):
 
 class RAGCore:
     
-    def __init__(self, kmid, streaming=False) -> None:
+    def __init__(self, kmid, streaming=False, rag_config=None, collection_name=None) -> None:
         if not RAGConfig.Kaleido_BASE_URL or not RAGConfig.Kaleido_API_KEY:
             raise ImproperlyConfigured(
                 "KALEIDO_LLM_BASE_URL and KALEIDO_LLM_API_KEY must be set"
             )
+        from .evaluation_service import normalize_rag_config
+
+        self.rag_config = normalize_rag_config(rag_config)
+        self.collection_name = collection_name or str(kmid)
         # LLM Client
         self.llm_client = ChatOpenAI(
             base_url=RAGConfig.Kaleido_BASE_URL,
@@ -197,7 +201,7 @@ class RAGCore:
         self.ollama_client = ollama.Client(host=RAGConfig.Kaleido_OLLAMA_BASE_URL)
         # VectorStore
         self.vectorstore = Chroma(
-            collection_name=kmid,
+            collection_name=self.collection_name,
             embedding_function=self.llm_embeddings,
             persist_directory="./chroma_db"
         )
@@ -244,7 +248,11 @@ class RAGCore:
             return None
 
     def splitter(self, docs):
-        splitter = RecursiveCharacterTextSplitter(chunk_size=RAGConfig.ChunkSize, chunk_overlap=RAGConfig.ChunkOverlap)
+        indexing = self.rag_config["indexing"]
+        splitter = RecursiveCharacterTextSplitter(
+            chunk_size=indexing["chunk_size"],
+            chunk_overlap=indexing["chunk_overlap"],
+        )
         documents = splitter.split_documents(docs)
         return documents
 
@@ -334,15 +342,8 @@ class RAGCore:
 
     def delete_collection(self):
         try:
-            result = self.vectorstore._collection.get()
-            ids = result.get('ids', [])
-            
-            if ids:
-                self.vectorstore._collection.delete(ids=ids)
-                logger.info(f"成功清空集合，删除 {len(ids)} 条记录")
-            else:
-                logger.info("集合为空")
-            
+            self.vectorstore.delete_collection()
+            logger.info(f"成功删除集合：{self.collection_name}")
             return True
         except Exception as e:
             logger.info(f"删除集合失败：{str(e)}")
@@ -411,7 +412,39 @@ class RAGCore:
             logger.info(f"获取所有文档失败：{str(e)}")
             return []
 
-    def build_ensemble_chain(self):
+    def build_ensemble_retriever(self):
+        """构建由当前实例 RAG 配置控制的混合检索器。"""
+        retrieval = self.rag_config["retrieval"]
+        all_docs = self.get_all_documents()
+        logger.info(f"混合检索候选文档数: {len(all_docs)}")
+        vector_retriever = self.vectorstore.as_retriever(
+            search_type="similarity",
+            search_kwargs={"k": retrieval["ensemble_top_k"]},
+        )
+
+        retrievers = [vector_retriever]
+        weights = [1.0]
+        if all_docs:
+            bm25_retriever = BM25Retriever.from_documents(all_docs)
+            bm25_retriever.k = retrieval["ensemble_top_k"]
+            retrievers.append(bm25_retriever)
+            vector_weight = retrieval["vector_weight"]
+            bm25_weight = retrieval["bm25_weight"]
+            total_weight = vector_weight + bm25_weight
+            weights = [vector_weight / total_weight, bm25_weight / total_weight]
+
+        return ContextualCompressionRetriever(
+            base_retriever=EnsembleRetriever(retrievers=retrievers, weights=weights),
+            base_compressor=OllamaRerankCompressor(
+                model=RAGConfig.Kaleido_RERANK_MODEL,
+                base_url=RAGConfig.Kaleido_OLLAMA_BASE_URL,
+                top_n=retrieval["rerank_top_k"],
+                timeout=RAGConfig.RerankTimeout,
+                ollama_client=self.ollama_client,
+            ),
+        )
+
+    def _build_document_chain(self):
         system_prompt = """
 {sys_prompt}
 上下文：<{context}>
@@ -419,45 +452,26 @@ class RAGCore:
         prompt = ChatPromptTemplate.from_messages([
             SystemMessagePromptTemplate.from_template(system_prompt),
             MessagesPlaceholder(variable_name="history"),
-            HumanMessagePromptTemplate.from_template("{input}")
+            HumanMessagePromptTemplate.from_template("{input}"),
         ])
+        return create_stuff_documents_chain(self.llm_client, prompt)
 
-        all_docs = self.get_all_documents()
-        logger.info(f"混合检索候选文档数: {len(all_docs)}")
+    def build_evaluation_answer(self, question, history_context, sys_prompt):
+        """使用内存历史执行评估，不读取或写入生产聊天历史。"""
+        retriever = self.build_ensemble_retriever()
+        documents = retriever.invoke(question)
+        document_chain = self._build_document_chain()
+        answer = document_chain.invoke({
+            "input": question,
+            "sys_prompt": sys_prompt or "",
+            "context": documents,
+            "history": history_context or [],
+        })
+        return str(answer), documents
 
-        vector_retriever = self.vectorstore.as_retriever(
-            search_type="similarity",
-            search_kwargs={"k": RAGConfig.RerankCandidateCount},
-        )
-
-        bm25_retriever = None
-        if all_docs:
-            bm25_retriever = BM25Retriever.from_documents(all_docs)
-            bm25_retriever.k = RAGConfig.RerankCandidateCount
-
-        retrievers = [vector_retriever]
-        weights = [1.0]
-        if bm25_retriever is not None:
-            retrievers.append(bm25_retriever)
-            weights = [0.8, 0.2]
-
-        ensemble_retriever = EnsembleRetriever(
-            retrievers=retrievers,
-            weights=weights,
-        )
-        compression_retriever = ContextualCompressionRetriever(
-            base_retriever=ensemble_retriever,
-            base_compressor=OllamaRerankCompressor(
-                model=RAGConfig.Kaleido_RERANK_MODEL,
-                base_url=RAGConfig.Kaleido_OLLAMA_BASE_URL,
-                top_n=RAGConfig.RerankTopN,
-                timeout=RAGConfig.RerankTimeout,
-                ollama_client=self.ollama_client,
-            ),
-        )
-
-        document_chain = create_stuff_documents_chain(self.llm_client, prompt)
-
+    def build_ensemble_chain(self):
+        document_chain = self._build_document_chain()
+        compression_retriever = self.build_ensemble_retriever()
         chain = (
             {
                 "input": itemgetter("input"),
@@ -468,14 +482,12 @@ class RAGCore:
             | document_chain
         )
 
-        chat_with_history = RunnableWithMessageHistory(
+        return RunnableWithMessageHistory(
             chain,
             self.get_session_history,
             input_messages_key="input",
             history_messages_key="history",
         )
-
-        return chat_with_history
 
     def get_session_history(self, session_id):
         db_config = settings.DATABASES['default']

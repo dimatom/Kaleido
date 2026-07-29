@@ -113,7 +113,7 @@ const router = createRouter({
             title: '首页'
           }
         },
-        {
+		{
           path: 'knowledge/:id',
           name: 'KnowledgeDetail',
           component: () => import('../views/KnowledgeDetail.vue'),
@@ -121,6 +121,15 @@ const router = createRouter({
             title: '知识库详情'
           }
         },
+        {
+          path: 'evaluation/:id',
+          name: 'EvaluationDetail',
+          component: () => import('../views/EvaluationDetail.vue'),
+          meta: {
+            title: 'RAG评估'
+          }
+        },
+
       ]
     },
     {

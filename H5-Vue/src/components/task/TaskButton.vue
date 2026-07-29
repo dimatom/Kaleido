@@ -33,8 +33,8 @@
           class="task-card"
         >
           <div class="task-card__head">
-            <span class="task-card__name" :title="t.km_name">{{ t.km_name }}</span>
-            <span class="task-card__count">{{ t.doc_count }} 个文件</span>
+            <span class="task-card__name" :title="t.title || t.km_name">{{ t.title || t.km_name }}</span>
+            <span class="task-card__count">{{ t.item_count ?? t.doc_count }} {{ t.item_unit || '个文件' }}</span>
           </div>
           <el-progress
             :percentage="t.progress"

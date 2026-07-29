@@ -15,6 +15,17 @@ urlpatterns = [
     path('document/parse/', views.DocumentParseView.as_view(), name='document_parse'),
     path('document/parse/task/', views.DocumentParseTaskView.as_view(), name='document_parse_task'),
     path('task/list/', views.TaskListView.as_view(), name='task_list'),
+    # RAG 评估接口
+    path('evaluation/precheck/', views.EvaluationPrecheckView.as_view(), name='evaluation_precheck'),
+    path('evaluation/', views.EvaluationListCreateView.as_view(), name='evaluation_list_create'),
+    path('evaluation/<uuid:pk>/', views.EvaluationDetailView.as_view(), name='evaluation_detail'),
+    path('evaluation/<uuid:evaluation_id>/data/', views.EvaluationDataListCreateView.as_view(), name='evaluation_data_list_create'),
+    path('evaluation/data/<uuid:pk>/', views.EvaluationDataDetailView.as_view(), name='evaluation_data_detail'),
+    path('evaluation/<uuid:evaluation_id>/tasks/', views.EvaluationTaskListCreateView.as_view(), name='evaluation_task_list_create'),
+    path('evaluation/task/<uuid:pk>/', views.EvaluationTaskDetailView.as_view(), name='evaluation_task_detail'),
+    path('evaluation/task/<uuid:task_id>/runs/', views.EvaluationRunListStartView.as_view(), name='evaluation_run_list_start'),
+    path('evaluation/run/<uuid:pk>/download/', views.EvaluationRunDownloadView.as_view(), name='evaluation_run_download'),
+    path('evaluation/task/<uuid:task_id>/apply-config/', views.EvaluationApplyConfigView.as_view(), name='evaluation_apply_config'),
     # Chat 接口
     path('testchat/', views.TestChatView.as_view(), name='testchat'),
     path('chat/', views.ChatView.as_view(), name='chat'),
